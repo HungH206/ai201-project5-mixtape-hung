@@ -184,3 +184,104 @@ key — so the user-visible search result is **1** row, not 3. The reported
 duplicate symptom therefore does not manifest in this environment, so I chose
 #4 instead. (The join is still latently incorrect and would surface duplicates if
 the query selected columns instead of the full entity.)
+
+---
+
+## Milestone 3 — Root Cause Analysis & Fixes
+
+**Baseline before any fix:** `pytest tests/` → **3 failed, 10 passed**. The three
+failures were the target tests for these bugs
+(`test_streak_increments_on_sunday`, `test_playlist_returns_all_songs`,
+`test_playlist_returns_songs_in_order`). **After all three fixes:** `pytest tests/`
+→ **13 passed**.
+
+### Issue #1 — My listening streak keeps resetting
+
+- **How I reproduced it:** Seeded the DB, took `darius` (streak = 3,
+  `last_listened_at` = yesterday), and called
+  `update_listening_streak(darius, now)` with `now` on a Sunday (2026-07-05) vs a
+  Monday (2026-07-06). Sunday reset the streak to **1**; Monday correctly gave
+  **4**. The bundled test `test_streak_increments_on_sunday` (Sat → Sun) also
+  failed with `1 != 2`.
+- **How I found the root cause:** Symptom is in the streak, so I opened
+  [streak_service.py](services/streak_service.py). `record_listening_event`
+  delegates the streak math to `update_listening_streak`, so I read that function
+  line by line. The `days_since_last == 0 / == 1 / else` ladder was correct, but
+  the "listened yesterday" branch had an extra clause: `and today.weekday() != 6`.
+  That clause has nothing to do with consecutive-day logic — that was the moment I
+  was sure this was the specific cause, not just a suspicious area.
+- **The root cause:** [streak_service.py:73](services/streak_service.py#L73). Python's
+  `datetime.weekday()` returns **6 for Sunday**. The increment branch was written
+  as `elif days_since_last == 1 and today.weekday() != 6:`. So whenever "today" is
+  a Sunday, a genuine consecutive-day listen (exactly 1 day since the last listen)
+  fails the `and`, falls through to the `else`, and resets the streak to 1. Every
+  streak that crossed into a Sunday was silently wiped — matching the "keeps
+  resetting" report.
+- **My fix & side-effect check:** Removed the spurious `and today.weekday() != 6`
+  so the branch is just `elif days_since_last == 1:`. Verified both sides of the
+  day boundary: same-day listen still no-ops (`days_since_last == 0`), a skipped
+  day still resets (`else`), and consecutive days increment on **every** weekday
+  including Sunday. Full suite: 13/13 pass (previously-failing Sunday test now
+  passes; the other streak tests still pass).
+- **AI usage:** After I located the `weekday() != 6` clause myself, I confirmed my
+  understanding that `datetime.weekday()` maps Monday=0…Sunday=6 (so `== 6` is
+  Sunday), then verified the fix by reading it and running the tests.
+
+### Issue #5 — The last song in a playlist never shows up
+
+- **How I reproduced it:** Called `get_playlist_songs()` on the seeded
+  "Late Night Vibes" playlist and compared to a direct `COUNT(*)` of its
+  `playlist_entries` rows: **7 in the DB, 6 returned**. The highest-`position`
+  song was always missing. Bundled tests `test_playlist_returns_all_songs`
+  (expects 5) and `test_playlist_returns_songs_in_order` (expects Track 1–5) both
+  failed.
+- **How I found the root cause:** Opened [playlist_service.py](services/playlist_service.py)
+  and read `get_playlist_songs`. The query itself was correct — join to
+  `playlist_entries`, filter by playlist, `order_by(asc(position))`. The tell was
+  the very last line: the ordered `songs` list was sliced with `songs[:-1]` in the
+  return statement.
+- **The root cause:** [playlist_service.py:66](services/playlist_service.py#L66). The
+  return was `return [song.to_dict() for song in songs[:-1]]`. The `[:-1]` slice
+  drops the final element of the list, and because the list is ordered ascending
+  by `position`, the dropped element is always the last (highest-position) song.
+  The query fetched all N songs correctly; the slice threw one away on the way out.
+- **My fix & side-effect check:** Changed the slice to iterate the full list:
+  `return [song.to_dict() for song in songs]`. Boundary check on both ends: a
+  non-empty playlist now returns all 7 songs in `position` order (Track 1…5 in the
+  test), and an empty playlist still returns `[]` without error
+  (`test_empty_playlist_returns_empty_list` passes — `songs` is `[]`, so the
+  comprehension yields `[]`). Full suite 13/13.
+- **AI usage:** None needed for diagnosis — the `[:-1]` was self-evident once read.
+  Used AI only to sanity-check that `list[:-1]` on an empty list is `[]` (so the
+  empty-playlist path was unaffected), which I then confirmed by running the test.
+
+### Issue #4 — Notified when a friend adds my song to a playlist, but not when they rate it
+
+- **How I reproduced it:** Took a song shared by `simone`, had `darius` (a
+  different user) act on it, and counted `simone`'s notifications after each
+  action. `add_to_playlist(...)` → notifications 0 → **1**; `rate_song(darius,
+  song, 5)` → stayed at **1** (delta 0). Adding notifies the sharer; rating does
+  not.
+- **How I found the root cause:** Opened [notification_service.py](services/notification_service.py)
+  and compared the two sibling functions directly, since one works and one
+  doesn't. `add_to_playlist` ends with an `if song.shared_by != added_by_user_id:`
+  guard that calls `create_notification(...)`. `rate_song` upserts the `Rating`,
+  commits, and returns — with **no** `create_notification` call anywhere. The
+  structural difference between the two blocks was the confirmation.
+- **The root cause:** [notification_service.py:73-110](services/notification_service.py#L73-L110).
+  `rate_song` never creates a notification. It's not a broken condition — the
+  side-effect step that the parallel `add_to_playlist` performs is simply absent
+  from the rating path, so the sharer is never told their song was rated.
+- **My fix & side-effect check:** After the rating commits, added the same
+  sharer-notification pattern used by `add_to_playlist`, guarded by
+  `if song.shared_by != user_id:` with type `"song_rated"`. Checks: (a) a friend
+  rating your song now creates exactly one notification (delta 1); (b) rating your
+  **own** song creates none (verified: 0 → 0), because of the `shared_by != user_id`
+  guard; (c) the notification is created only after the rating commit, so a bad
+  score (`ValueError` for out-of-range) still short-circuits before any
+  notification; (d) the `Rating` unique-constraint upsert path is unchanged, so
+  re-rating still updates the existing row. Full suite 13/13 (no test regressed;
+  no existing test covered this path).
+- **AI usage:** Used AI to diff the two blocks (`add_to_playlist` vs `rate_song`)
+  and confirm the working notification pattern I was mirroring; I verified the fix
+  by re-running my reproduction script and the self-rating edge case.
