@@ -1,5 +1,63 @@
 # Project 5: Mixtape Bug Hunt — Submission
 
+## AI Usage
+
+I used an AI coding assistant (Claude) throughout this project as a
+pair-programming partner, and this section is an honest account of *what* it did,
+*what I directed and decided*, and *where I had to verify or correct it*.
+
+**Milestone 1 (codebase map).** I had the AI read the `routes → services → models`
+layers and summarize the architecture, the data model, and which service each of
+the five issues lived in. I used this to orient quickly, then confirmed the claims
+by opening the files myself — e.g. checking that `playlist_entries` really carries
+a `position` column and that rating and add-to-playlist both route through
+`notification_service`.
+
+**Milestone 2 (reproduction).** I had the AI write small Python harness scripts
+that call the service functions directly inside the Flask app context, so I could
+observe each bug against the seeded data instead of firing HTTP requests. This is
+where the AI was most useful *and* where verifying it mattered most:
+
+- For **Issue #3** ("same song shows up twice in search"), the plausible diagnosis
+  was that the `outerjoin(song_tags)` returns one row per tag, so a 3-tag song
+  would appear 3 times. When I actually **ran** it, the search returned **1** row,
+  not 3 — SQLAlchemy 2.0's `Query.all()` de-duplicates full ORM entities by
+  primary key, so the reported symptom does not reproduce in this environment. The
+  raw SQL does return 3 rows (the join is genuinely wrong), but the user-visible
+  bug doesn't manifest. This is the clearest case where the surface-level
+  explanation was incomplete and only *running the code* settled it — so I dropped
+  #3 and picked #4 instead.
+
+**Milestone 3 (diagnosis, fixes, RCA).** For each chosen bug I had the AI trace
+from the symptom to the suspect function and explain the code, then I read the
+code myself to confirm the specific cause before changing anything:
+
+- **Issue #1:** the AI flagged the `and today.weekday() != 6` clause in
+  `update_listening_streak`. I verified the diagnosis by confirming Python's
+  `datetime.weekday()` maps Monday=0…Sunday=6 (so `== 6` really is Sunday) and by
+  reproducing the reset on a Sunday vs. a correct increment on a Monday.
+- **Issue #5:** the AI pointed at the `songs[:-1]` slice in the return of
+  `get_playlist_songs`. I confirmed by comparing the returned count to a direct
+  `COUNT(*)` of `playlist_entries`, and checked the empty-playlist path so the fix
+  wouldn't error on `[]`.
+- **Issue #4:** the AI diffed `rate_song` against its working sibling
+  `add_to_playlist` and identified the missing `create_notification` call. I
+  confirmed the fix notifies on a friend's rating but *not* on a self-rating
+  (the `shared_by != user_id` guard).
+
+**Verification I owned.** Every fix was checked against the existing `pytest`
+suite (**3 failed → 13 passed**) and against both sides of each boundary condition
+(same-day / consecutive / skipped-day for #1; non-empty / empty playlist for #5;
+friend-rate / self-rate for #4). I did not accept a fix as done until I had run it.
+
+**Bottom line.** The AI accelerated navigation, reproduction scripting, and
+drafting the write-ups, but I made the decisions (which bugs to pick, swapping #3
+for #4), and the one place a confident-sounding explanation was wrong (#3) was
+caught only by running the code myself — which is exactly why reproducing before
+fixing was worth the time.
+
+---
+
 ## Milestone 1 — Codebase Map
 
 Mixtape is a Flask + SQLAlchemy social music app. The architecture is a clean
